@@ -1,12 +1,21 @@
 import WebSocketClient from 'ws';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { aesKey, imageMime, mediaName, mediaUrl, readEncryptedMedia, validateMediaReply } from './media.js';
 
 const ENDPOINT = 'wss://openws.work.weixin.qq.com';
 const MAX_FRAME = 1024 * 1024;
 
 function validString(value, limit = 512) {
-  return typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\u0000-\u001f]/u.test(value);
+  return typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\u0000-\u001f\u007f\uD800-\uDFFF]/u.test(value);
+}
+
+function authorizeSend(authorize) {
+  if (authorize === undefined) return;
+  if (typeof authorize !== 'function') throw new Error('WeCom send authorization is invalid.');
+  const result = authorize();
+  if (result && typeof result.then === 'function') Promise.resolve(result).catch(() => {});
+  if (result !== undefined) throw new Error('WeCom send authorization must be synchronous.');
 }
 
 function required(value, limit = 512) {
@@ -16,6 +25,24 @@ function required(value, limit = 512) {
 
 function messageContent(body) {
   const attachments = [];
+  const mediaRefs = [];
+  function add(part) {
+    if (attachments.length >= 10) return;
+    const kind = part.msgtype === 'voice' ? 'audio' : part.msgtype;
+    const info = part[part.msgtype] ?? {};
+    const attachment = { kind };
+    if (mediaName(info.filename)) attachment.name = info.filename;
+    attachments.push(attachment);
+    let reference = null;
+    if (['image', 'file'].includes(kind)) {
+      try {
+        const url = mediaUrl(info.url);
+        aesKey(info.aeskey).fill(0);
+        reference = { url, aeskey: info.aeskey, expiresAt: Date.now() + 5 * 60_000 };
+      } catch { /* Preserve safe metadata when a resource cannot be read. */ }
+    }
+    mediaRefs.push(reference);
+  }
   let text = '';
   if (body.msgtype === 'text') text = body.text?.content;
   else if (body.msgtype === 'mixed' && Array.isArray(body.mixed?.msg_item)) {
@@ -23,28 +50,26 @@ function messageContent(body) {
     for (const part of body.mixed.msg_item.slice(0, 100)) {
       if (part?.msgtype === 'text' && typeof part.text?.content === 'string') texts.push(part.text.content);
       else if (['image', 'file', 'video', 'voice'].includes(part?.msgtype)) {
-        attachments.push({ kind: part.msgtype === 'voice' ? 'audio' : part.msgtype });
+        add(part);
       }
     }
     text = texts.join('\n');
   } else if (['image', 'file', 'video', 'voice'].includes(body.msgtype)) {
-    const item = { kind: body.msgtype === 'voice' ? 'audio' : body.msgtype };
-    if (validString(body[body.msgtype]?.filename, 255)) item.name = body[body.msgtype].filename;
-    attachments.push(item);
+    add(body);
     // This is the platform-provided transcript, not downloaded audio.
     if (body.msgtype === 'voice') text = body.voice?.content ?? body.voice?.text;
   } else return null;
   if (typeof text !== 'string') text = '';
   if (text.length > 20_000 || (!text.trim() && attachments.length === 0)) return null;
-  return { text, attachments: attachments.slice(0, 10) };
+  return { text, attachments, mediaRefs };
 }
 
-export function createProvider({ credentials, onMessage, signal, WebSocket = WebSocketClient, timing = {} }) {
-  if (!credentials || typeof onMessage !== 'function') throw new Error('WeCom provider configuration is invalid.');
+function createTransport({ credentials, onMessage, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, timing = {} }, onPairingMessage) {
+  if (!credentials || typeof onMessage !== 'function' || typeof fetch !== 'function') throw new Error('WeCom provider configuration is invalid.');
   const botId = required(credentials.botId);
   const secret = required(credentials.secret, 4096);
-  const ownerId = required(credentials.ownerId);
-  const conversationId = required(credentials.conversationId);
+  const ownerId = onPairingMessage ? undefined : required(credentials.ownerId, 256);
+  const conversationId = onPairingMessage ? undefined : required(credentials.conversationId, 256);
   // Official single-chat sending identifies the chat by userid. Keeping one
   // convention avoids accepting a group chat with the same configured owner.
   if (conversationId !== ownerId) throw new Error('WeCom private conversationId must match ownerId.');
@@ -60,6 +85,7 @@ export function createProvider({ credentials, onMessage, signal, WebSocket = Web
   let authenticationFailed = false;
   let failedAuthentications = 0;
   const tasks = new Set();
+  const mediaTasks = new Set();
   const pending = new Map();
 
   function failPending(source) {
@@ -89,15 +115,53 @@ export function createProvider({ credentials, onMessage, signal, WebSocket = Web
     });
   }
 
+  function request(source, reqId, cmd, body) {
+    if (!connected || source !== socket || controller.signal.aborted) return Promise.reject(new Error('WeCom is disconnected.'));
+    if (pending.size >= 32 || pending.has(reqId)) return Promise.reject(new Error('WeCom reply is already pending.'));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (pending.get(reqId)?.source !== source) return;
+        pending.delete(reqId);
+        reject(new Error('WeCom reply acknowledgement was not confirmed.'));
+      }, requestTimeout);
+      pending.set(reqId, { source, timer, resolve, reject });
+      try { write(source, { cmd, headers: { req_id: reqId }, body }); }
+      catch {
+        clearTimeout(timer);
+        pending.delete(reqId);
+        reject(new Error('WeCom reply acknowledgement was not confirmed.'));
+      }
+    });
+  }
+
+  function ownMessage(message) {
+    if (message?.senderId !== ownerId || message?.conversationId !== conversationId ||
+        !validString(message.replyContext?.reqId)) throw new Error('WeCom message binding is invalid.');
+  }
+
+  async function track(work) {
+    mediaTasks.add(work);
+    try { return await work; } finally { mediaTasks.delete(work); }
+  }
+
   async function ingest(frame) {
     const body = frame.body;
     if (!body || typeof body !== 'object' || body.chattype !== 'single' || body.aibotid !== botId ||
-        body.from?.userid !== ownerId || !validString(body.msgid, 256) || !validString(frame.headers?.req_id)) return;
+        (!onPairingMessage && body.from?.userid !== ownerId) || !validString(body.msgid, 256) || !validString(frame.headers?.req_id)) return;
+    if (onPairingMessage) {
+      if (body.msgtype === 'text' && validString(body.from?.userid, 256) && body.from.userid !== botId &&
+          !body.from.bot && !body.isForward && !body.isForwarded && !body.forwarded && !body.forward && !body.quote) {
+        await onPairingMessage({ text: body.text?.content, ownerId: body.from.userid, conversationId: body.from.userid,
+          ...(Number.isSafeInteger(body.create_time) ? { timestamp: body.create_time * 1000 } : {}) });
+      }
+      return;
+    }
     const content = messageContent(body);
     if (!content) return;
+    const { mediaRefs, ...parts } = content;
     const message = {
-      id: body.msgid, senderId: ownerId, conversationId, ...content,
-      replyContext: { reqId: frame.headers.req_id },
+      id: body.msgid, senderId: ownerId, conversationId, ...parts,
+      replyContext: { reqId: frame.headers.req_id, ...(mediaRefs.length ? { mediaRefs } : {}) },
     };
     if (Number.isSafeInteger(body.create_time) && body.create_time > 0 && Number.isSafeInteger(body.create_time * 1000)) {
       message.timestamp = body.create_time * 1000;
@@ -173,7 +237,7 @@ export function createProvider({ credentials, onMessage, signal, WebSocket = Web
           if (item?.source === source) {
             clearTimeout(item.timer);
             pending.delete(reqId);
-            if (frame.errcode === 0) item.resolve({});
+            if (frame.errcode === 0) item.resolve(frame.body ?? {});
             else item.reject(new Error('WeCom reply acknowledgement was not confirmed.'));
           }
           return;
@@ -222,10 +286,63 @@ export function createProvider({ credentials, onMessage, signal, WebSocket = Web
       abort();
       signal?.removeEventListener('abort', abort);
       await runner;
-      await Promise.allSettled([...tasks]);
+      await Promise.allSettled([...tasks, ...mediaTasks]);
     },
     status() { return { connected, displaced, authenticationFailed }; },
-    async sendReply({ message, text, idempotencyKey }) {
+    validateMediaReply,
+    async readAttachment({ message, attachmentIndex }) {
+      ownMessage(message);
+      if (controller.signal.aborted) throw new Error('WeCom provider has stopped.');
+      const attachment = message.attachments?.[attachmentIndex];
+      const reference = message.replyContext.mediaRefs?.[attachmentIndex];
+      if (!Number.isSafeInteger(attachmentIndex) || attachmentIndex < 0 || !['image', 'file'].includes(attachment?.kind) ||
+          !reference || !Number.isSafeInteger(reference.expiresAt) || reference.expiresAt <= Date.now()) {
+        throw new Error('WeCom attachment is unavailable or its five-minute download window expired.');
+      }
+      const url = mediaUrl(reference.url);
+      aesKey(reference.aeskey).fill(0);
+      return track((async () => {
+        try {
+          const response = await fetch(url, { method: 'GET', redirect: 'error',
+            signal: AbortSignal.any([controller.signal, AbortSignal.timeout(requestTimeout)]),
+          });
+          const data = await readEncryptedMedia(response, reference.aeskey);
+          const mimeType = attachment.kind === 'image' ? imageMime(data) : 'application/octet-stream';
+          return { data, mimeType, ...(attachment.name ? { name: attachment.name } : {}) };
+        } catch { throw new Error('WeCom media download or decryption failed.'); }
+      })());
+    },
+    async sendMediaReply({ message, media, text, idempotencyKey, authorize }) {
+      ownMessage(message);
+      validateMediaReply({ media, text });
+      if (!validString(idempotencyKey, 1024)) throw new Error('WeCom reply key is invalid.');
+      const source = socket;
+      const type = media.type === 'audio' ? 'voice' : media.type;
+      const chunkSize = 512 * 1024;
+      return track((async () => {
+        authorizeSend(authorize);
+        const init = await request(source, `media_init_${randomUUID()}`, 'aibot_upload_media_init', {
+          type, filename: media.name, total_size: media.data.length,
+          total_chunks: Math.ceil(media.data.length / chunkSize), md5: createHash('md5').update(media.data).digest('hex'),
+        });
+        if (!validString(init.upload_id)) throw new Error('WeCom media upload was not confirmed.');
+        for (let offset = 0; offset < media.data.length; offset += chunkSize) {
+          authorizeSend(authorize);
+          await request(source, `media_chunk_${randomUUID()}`, 'aibot_upload_media_chunk', {
+            upload_id: init.upload_id, chunk_index: offset / chunkSize,
+            base64_data: media.data.subarray(offset, offset + chunkSize).toString('base64'),
+          });
+        }
+        authorizeSend(authorize);
+        const result = await request(source, `media_finish_${randomUUID()}`, 'aibot_upload_media_finish', { upload_id: init.upload_id });
+        if (!validString(result.media_id) || result.type !== type) throw new Error('WeCom media upload was not confirmed.');
+        ownMessage(message);
+        authorizeSend(authorize);
+        await request(source, message.replyContext.reqId, 'aibot_respond_msg', { msgtype: type, [type]: { media_id: result.media_id } });
+        return {};
+      })());
+    },
+    async sendReply({ message, text, idempotencyKey, authorize }) {
       if (!connected || controller.signal.aborted || !socket) throw new Error('WeCom is disconnected.');
       if (message?.senderId !== ownerId || message?.conversationId !== conversationId ||
           !validString(message.replyContext?.reqId) || typeof text !== 'string' || !text.trim() ||
@@ -233,27 +350,19 @@ export function createProvider({ credentials, onMessage, signal, WebSocket = Web
         throw new Error('WeCom reply is invalid or exceeds 20,480 UTF-8 bytes.');
       }
       const reqId = message.replyContext.reqId;
-      if (pending.size >= 32 || pending.has(reqId)) throw new Error('WeCom reply is already pending.');
       const streamId = `dotbridge_${createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 32)}`;
       const source = socket;
-      return await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          if (pending.get(reqId)?.source !== source) return;
-          pending.delete(reqId);
-          reject(new Error('WeCom reply acknowledgement was not confirmed.'));
-        }, requestTimeout);
-        pending.set(reqId, { source, timer, resolve, reject });
-        try {
-          write(source, {
-            cmd: 'aibot_respond_msg', headers: { req_id: reqId },
-            body: { msgtype: 'stream', stream: { id: streamId, finish: true, content: text } },
-          });
-        } catch {
-          clearTimeout(timer);
-          pending.delete(reqId);
-          reject(new Error('WeCom reply acknowledgement was not confirmed.'));
-        }
-      });
+      authorizeSend(authorize);
+      await request(source, reqId, 'aibot_respond_msg', { msgtype: 'stream', stream: { id: streamId, finish: true, content: text } });
+      return {};
     },
   };
+}
+
+export function createProvider(options) { return createTransport(options); }
+
+export function createEnrollmentProvider(options) {
+  if (options?.confirmStopped !== true || typeof options.onPairingMessage !== 'function') throw new Error('WeCom pairing requires confirmation that the old consumer is stopped.');
+  const provider = createTransport({ ...options, onMessage: async () => {} }, options.onPairingMessage);
+  return { start: provider.start, stop: provider.stop, status: provider.status };
 }
