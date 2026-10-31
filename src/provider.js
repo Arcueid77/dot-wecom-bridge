@@ -2,6 +2,7 @@ import WebSocketClient from 'ws';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { aesKey, imageMime, mediaName, mediaUrl, readEncryptedMedia, validateMediaReply } from './media.js';
+import {channel} from './channel.js';
 
 const ENDPOINT = 'wss://openws.work.weixin.qq.com';
 const MAX_FRAME = 1024 * 1024;
@@ -274,7 +275,7 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
     }
   }
 
-  return {
+  const provider = {
     async start() {
       if (stopped) throw new Error('WeCom provider has stopped.');
       if (started) return;
@@ -345,9 +346,14 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
     async sendReply({ message, text, idempotencyKey, authorize }) {
       if (!connected || controller.signal.aborted || !socket) throw new Error('WeCom is disconnected.');
       if (message?.senderId !== ownerId || message?.conversationId !== conversationId ||
-          !validString(message.replyContext?.reqId) || typeof text !== 'string' || !text.trim() ||
-          text.length > 20_000 || Buffer.byteLength(text) > 20_480 || !validString(idempotencyKey, 1024)) {
-        throw new Error('WeCom reply is invalid or exceeds 20,480 UTF-8 bytes.');
+          !validString(message.replyContext?.reqId) || typeof text !== 'string' || !text.trim() || !text.isWellFormed() ||
+          text.length > channel.maxReplyText || Buffer.byteLength(text) > 60000 || !validString(idempotencyKey, 1024)) {
+        throw new Error('WeCom reply is invalid or exceeds 20,000 characters.');
+      }
+      if (text.length > channel.nativeMaxReplyText || Buffer.byteLength(text) > 20480) {
+        const data = Buffer.from(text, 'utf8');
+        try { return await provider.sendMediaReply({message, media: {type: 'file', data, mimeType: 'text/plain', name: 'answer.txt'}, idempotencyKey, authorize}); }
+        finally { data.fill(0); }
       }
       const reqId = message.replyContext.reqId;
       const streamId = `dotbridge_${createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 32)}`;
@@ -357,6 +363,7 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
       return {};
     },
   };
+  return provider;
 }
 
 export function createProvider(options) { return createTransport(options); }

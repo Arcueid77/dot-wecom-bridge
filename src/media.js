@@ -1,6 +1,7 @@
 import { createDecipheriv } from 'node:crypto';
 
-export const MAX_MEDIA = 8 * 1024 * 1024;
+import {MAX_MEDIA_BYTES as MAX_MEDIA} from '@dot-bridge/core/channels/media.js';
+export {MAX_MEDIA};
 
 export function mediaUrl(value) {
   if (typeof value !== 'string' || value.length > 8192 || /[\u0000-\u0020\\]/u.test(value)) throw new Error('WeCom media URL is invalid.');
@@ -49,7 +50,7 @@ export function validateMediaReply({ media, text }) {
   if (!media || !['image', 'audio', 'file'].includes(media.type) || !Buffer.isBuffer(media.data) ||
       media.data.length < 5 || media.data.length > MAX_MEDIA || !mediaName(media.name) ||
       typeof media.mimeType !== 'string' || !/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/iu.test(media.mimeType) ||
-      (text !== undefined && text !== '')) throw new Error('WeCom media requires one file up to 8 MiB without a caption.');
+      (text !== undefined && text !== '')) throw new Error('WeCom media requires one file up to 5 MiB without a caption.');
   if (media.type === 'image' && imageMime(media.data) !== media.mimeType) throw new Error('WeCom image type does not match its content.');
   if (media.type === 'audio' && (media.data.length > 2 * 1024 * 1024 || media.mimeType !== 'audio/amr' ||
       !validAmr(media.data))) throw new Error('WeCom voice requires a complete AMR file up to 2 MiB.');

@@ -14,7 +14,10 @@ Final text is sent once with the original callback `req_id` and a stable hashed
 stream ID; success requires a matching successful ACK. There is no automatic
 retry, alternate-recipient API or proactive-send fallback. Reply size is bounded
 conservatively in channel metadata and checked again against the documented
-20,480 UTF-8 byte stream limit. Network reconnects have exponential backoff;
+20,480 UTF-8 byte stream limit. Input accepts at most 20,000 well-formed UTF-16
+characters / 60,000 UTF-8 bytes. Above 6,826 characters or the native byte bound,
+one `answer.txt` is uploaded and replied using the original req_id; no native
+text send is attempted before or after it. Network reconnects have exponential backoff;
 another-instance `disconnected_event` stops reconnecting to avoid an eviction
 loop. Five consecutive explicit authentication failures stop reconnecting.
 

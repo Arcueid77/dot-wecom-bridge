@@ -49,9 +49,36 @@ async function until(check) {
   while (!check()) { if (Date.now() > end) throw new Error('Fixture timeout.'); await delay(1); }
 }
 
+test('long answers upload one complete UTF-8 text file and send one final file response', async t => {
+  const {Socket, instances} = sockets();
+  const provider = createProvider({credentials, WebSocket: Socket, onMessage: async () => {}});
+  t.after(() => provider.stop()); await provider.start(); instances[0].open(); await until(() => provider.status().connected);
+  const text = '汉'.repeat(19998) + '🌏';
+  await provider.sendReply({message: stored(), text, idempotencyKey: 'long'});
+  const chunks = instances[0].sent.filter(frame => frame.cmd === 'aibot_upload_media_chunk');
+  const content = Buffer.concat(chunks.map(frame => Buffer.from(frame.body.base64_data, 'base64'))).toString('utf8');
+  assert.equal(content, text);
+  const final = instances[0].sent.filter(frame => frame.cmd === 'aibot_respond_msg');
+  assert.equal(final.length, 1);
+  assert.equal(final[0].body.msgtype, 'file');
+  const before = instances[0].sent.length;
+  await assert.rejects(provider.sendReply({message: stored(), text: 'x\uD800', idempotencyKey: 'invalid'}));
+  await assert.rejects(provider.sendReply({message: stored(), text: 'x'.repeat(20001), idempotencyKey: 'large'}));
+  assert.equal(instances[0].sent.length, before);
+});
+
 test('WeCom advertises raw image/file reads and AMR/image/file replies, but not raw incoming voice', () => {
   assert.deepEqual(channel.media, { read: ['image', 'file'], reply: ['image', 'audio', 'file'] });
   assert.equal(channel.maxMediaReplyText, 0);
+});
+
+test('an uncertain long-answer file response never falls back to another stream or repeats', async t => {
+  const {Socket, instances} = sockets({ignoreAt: 'aibot_respond_msg'});
+  const provider = createProvider({credentials, WebSocket: Socket, timing: {requestTimeoutMs: 25}, onMessage: async () => {}});
+  t.after(() => provider.stop()); await provider.start(); instances[0].open(); await until(() => provider.status().connected);
+  await assert.rejects(provider.sendReply({message: stored(), text: '汉'.repeat(7000), idempotencyKey: 'long'}));
+  const final = instances[0].sent.filter(frame => frame.cmd === 'aibot_respond_msg');
+  assert.equal(final.length, 1); assert.equal(final[0].body.msgtype, 'file');
 });
 
 test('authenticated callbacks retain media references privately and voice remains a transcript', async t => {

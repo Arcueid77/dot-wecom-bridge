@@ -147,7 +147,7 @@ test('oversize text and unrelated stored recipient are rejected before send', as
   const provider = createProvider({ credentials, WebSocket: Socket, onMessage: async event => { received.push(event); } });
   t.after(() => provider.stop()); await provider.start(); const socket = instances[0]; socket.authenticate();
   socket.receive(message()); await until(() => received.length === 1);
-  await assert.rejects(provider.sendReply({ message: received[0], text: '汉'.repeat(7000), idempotencyKey: 'fixture-key' }));
+  await assert.rejects(provider.sendReply({ message: received[0], text: '汉'.repeat(20001), idempotencyKey: 'fixture-key' }));
   await assert.rejects(provider.sendReply({ message: { ...received[0], conversationId: 'other-chat' }, text: 'Fixture reply', idempotencyKey: 'fixture-key' }));
   assert.equal(socket.sent.length, 1);
 });
