@@ -290,6 +290,12 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
       await Promise.allSettled([...tasks, ...mediaTasks]);
     },
     status() { return { connected, displaced, authenticationFailed }; },
+    async sendOwnerMessage({text, authorize}) {
+      if (!connected || controller.signal.aborted || !socket || !ownerId || typeof text !== 'string' || !text.trim() || !text.isWellFormed() || text.length > 2000) throw new Error('WeCom owner text is unavailable.');
+      authorizeSend(authorize);
+      await request(socket, `outbound_${randomUUID()}`, 'aibot_send_msg', {chatid:conversationId, msgtype:'markdown', markdown:{content:text}});
+      return {};
+    },
     validateMediaReply,
     async readAttachment({ message, attachmentIndex }) {
       ownMessage(message);

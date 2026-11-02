@@ -37,6 +37,14 @@ function message(overrides = {}, reqId = 'fixture-req') {
   };
 }
 
+test('proactive WeCom uses a fresh request ID and the bound single chat rather than a callback request',async t=>{
+ const {Socket,instances}=sockets();const provider=createProvider({credentials,WebSocket:Socket,onMessage:async()=>{}});t.after(()=>provider.stop());await provider.start();instances[0].authenticate();
+ const send=provider.sendOwnerMessage({text:'fixture notification',authorize:()=>{}}),frame=instances[0].sent.at(-1);
+ assert.equal(frame.cmd,'aibot_send_msg');assert.deepEqual(frame.body,{chatid:credentials.ownerId,msgtype:'markdown',markdown:{content:'fixture notification'}});assert.match(frame.headers.req_id,/^outbound_/);
+ instances[0].receive({headers:frame.headers,errcode:0});await send;
+ const before=instances[0].sent.length;await assert.rejects(provider.sendOwnerMessage({text:'blocked',authorize:()=>{throw Error('revoked');}}));assert.equal(instances[0].sent.length,before);
+});
+
 test('fixed official endpoint authenticates before accepting private text', async t => {
   const { Socket, instances } = sockets();
   const messages = [];
