@@ -1,5 +1,7 @@
 # dot-wecom-bridge
 
+[English](README.en.md)
+
 把本人企业微信私聊接到原来的 ChatGPT dot。通过企业微信**智能机器人长连接模式**接收消息，再由官方 Secure MCP Tunnel 交给 dot，最终回复回到原私聊。
 
 本仓库负责企业微信收发，共享运行和存储能力由 `dot-bridge-core` 提供。需要同时使用多个聊天应用时，从 [DotBridge 总仓库](https://github.com/Arcueid77/dot-bridge)安装和管理。
@@ -14,10 +16,12 @@
 
 可以让 dot 把收到的图片或文件直接发回原私聊，桥会按附件编号读取，不需要来回传递很长的编码文本。企业微信提供的语音转写仍是文字，不能据此回发原始录音。
 
-TXT、Markdown、JSON、CSV 等文本附件会提供可读的文字摘录，支持 UTF-8 和带标记的 UTF-16；过长时明确标记为截断，原文件仍可读取。其他格式继续保留原件。
+TXT、Markdown、JSON、CSV 等文本附件会提供可读的文字摘录，支持 UTF-8 和带标记的 UTF-16；过长时明确标记为截断，原文件仍可读取。PDF／Office 摘录复用受保护的 Linux 处理环境，原件继续保留。
+
+运行主机可使用持续开机的 Linux 或 Windows 电脑，Linux 支持 systemd。macOS 尚未验证，欢迎试用并反馈。
 
 ## 定时消息
 
 新增主动文字和固定提醒：目标只允许已绑定的本人私聊，主动发送默认关闭。管理员批准后可设置 `DOT_BRIDGE_OUTBOUND=owner-text`；原 dot 通过发送、保存提醒、查询、修改和取消工具管理，不需要重建事件订阅。每条最多 2,000 字符，重复提醒需有结束日期。
 
-详见[定时消息使用指南](https://github.com/Arcueid77/dot-bridge/blob/dev/unified-distribution/docs/scheduled-messages.md)。
+详见[定时消息使用指南](https://github.com/Arcueid77/dot-bridge/blob/main/docs/scheduled-messages.md)。

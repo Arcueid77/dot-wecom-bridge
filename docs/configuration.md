@@ -1,5 +1,7 @@
 # 配置与使用
 
+[English](configuration.en.md)
+
 需要 Node.js `>=24.15` 且 `<25`，并安装锁定的依赖：
 
 ```sh
@@ -61,7 +63,7 @@ BRIDGE_MODE=tunnel
 TUNNEL_SERVICE_OPERATION=live
 TUNNEL_SERVICE_OWNER_ID=tunnel-owner:dot-bridge
 HOST=127.0.0.1
-PORT=8791
+PORT=8802
 WECOM_TRANSPORT=websocket
 TUNNEL_SERVICE_KEY_FILE=/var/lib/dot-bridge/private/wecom.service-key
 WECOM_CREDENTIALS_FILE=/var/lib/dot-bridge/private/wecom/credentials.json
@@ -71,6 +73,8 @@ BRIDGE_LOCK_DIRECTORY=/var/lib/dot-bridge/data/locks
 CALLBACK_TRANSPORT_MODE=standard
 CALLBACK_HOSTS=替换为原dot真实订阅回调的精确域名
 ```
+
+示例显式使用 8802；省略 `PORT` 时组件内置值为 8791。组合部署先选择实际空闲端口。
 
 部署人员需要安全准备独立的服务 key 和存储 key。存储 key 是 32 字节的标准 Base64 编码，并且必须与原数据库和备份一起保留；服务 key 不得与路由器或其他渠道共用。`CALLBACK_HOSTS` 使用原 dot 实际订阅地址的精确域名。
 
@@ -84,11 +88,11 @@ node --env-file=/var/lib/dot-bridge/private/wecom.env scripts/run-live.js --conf
 
 ## 使用原 dot
 
-按[总仓库运行说明](https://github.com/Arcueid77/dot-bridge/blob/dev/unified-distribution/docs/operations.md)连接 Tunnel，在原来的 dot 中刷新插件并建立 `wecom.message.created` 的真实事件订阅。工具目录会提供 `get_wecom_message`、`get_wecom_attachment`、`reply_to_wecom`、`reply_wecom_media`、`get_wecom_reply_status` 和 `check_wecom_setup`。先取得真实回调地址，再配置和确认精确域名。
+按[总仓库运行说明](https://github.com/Arcueid77/dot-bridge/blob/main/docs/operations.md)连接 Tunnel，在原来的 dot 中刷新插件并建立 `wecom.message.created` 的真实事件订阅。工具目录会提供 `get_wecom_message`、`get_wecom_attachment`、`reply_to_wecom`、`reply_wecom_media`、`get_wecom_reply_status` 和 `check_wecom_readiness`。先取得真实回调地址，再配置和确认精确域名。
 
 完成后，从本人绑定的企业微信私聊发一条独特的文字，确认原 dot 收到且原私聊只回复一次。普通文字和平台语音转写会交给 dot；图片与文件可按需读取。附件下载地址和解密 key 保存在服务端私有状态，不会出现在工具结果中。[附件与回复](media.md)列出了格式和时效。
 
-没有回答时，让原 dot 查看 `check_wecom_setup` 的 `gateway_connected` 与 `subscription_active`。前者为企业微信连接情况，后者为原 dot 的有效订阅。订阅失败时看该工具提供的失败阶段和原因，再处理对应问题，不要反复创建。回调域名配置使用 `CALLBACK_HOSTS`，填写原 dot 真实回调的精确域名。
+没有回答时，让原 dot 查看 `check_wecom_readiness` 的 `gateway_connected` 与 `subscription_active`。前者为企业微信连接情况，后者为原 dot 的有效订阅。订阅失败时看该工具提供的失败阶段和原因，再处理对应问题，不要反复创建。回调域名配置使用 `CALLBACK_HOSTS`，填写原 dot 真实回调的精确域名。
 
 每条最终回复最多 20,000 字符。6,826 字符且不超过 20,480 UTF-8 字节时，作为一条已完成的文字消息发送；更长的回答以完整 `answer.txt` 文件回复，不截断或分成多次发送。桥会等待对应回复回执；超时或断线会保留“结果不明”，不会自动重发，也不会改走主动群发接口。
 
