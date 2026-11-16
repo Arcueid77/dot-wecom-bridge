@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { aesKey, imageMime, mediaName, mediaUrl, readEncryptedMedia, validateMediaReply } from './media.js';
 import {channel} from './channel.js';
+import {conversationRoute, interactionPolicy} from '@dot-bridge/core/channels/experience-policy.js';
 
 const ENDPOINT = 'wss://openws.work.weixin.qq.com';
 const MAX_FRAME = 1024 * 1024;
@@ -65,7 +66,7 @@ function messageContent(body) {
   return { text, attachments, mediaRefs };
 }
 
-function createTransport({ credentials, onMessage, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, timing = {} }, onPairingMessage) {
+function createTransport({ credentials, interaction, onMessage, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, timing = {} }, onPairingMessage) {
   if (!credentials || typeof onMessage !== 'function' || typeof fetch !== 'function') throw new Error('WeCom provider configuration is invalid.');
   const botId = required(credentials.botId);
   const secret = required(credentials.secret, 4096);
@@ -74,6 +75,7 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
   // Official single-chat sending identifies the chat by userid. Keeping one
   // convention avoids accepting a group chat with the same configured owner.
   if (conversationId !== ownerId) throw new Error('WeCom private conversationId must match ownerId.');
+  const routing = {channel, credentials, interaction: interaction ?? interactionPolicy({}, channel)};
   const controller = new AbortController();
   const requestTimeout = timing.requestTimeoutMs ?? 10_000;
   const retryBase = timing.reconnectMs ?? 1000;
@@ -136,7 +138,7 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
   }
 
   function ownMessage(message) {
-    if (message?.senderId !== ownerId || message?.conversationId !== conversationId ||
+    if (!message || !conversationRoute(routing, message) ||
         !validString(message.replyContext?.reqId)) throw new Error('WeCom message binding is invalid.');
   }
 
@@ -147,8 +149,11 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
 
   async function ingest(frame) {
     const body = frame.body;
-    if (!body || typeof body !== 'object' || body.chattype !== 'single' || body.aibotid !== botId ||
-        (!onPairingMessage && body.from?.userid !== ownerId) || !validString(body.msgid, 256) || !validString(frame.headers?.req_id)) return;
+    if (!body || typeof body !== 'object' || !['single', 'group'].includes(body.chattype) || body.aibotid !== botId ||
+        !validString(body.from?.userid, 256) || body.from.userid === botId || body.from.bot ||
+        !validString(body.msgid, 256) || !validString(frame.headers?.req_id)) return;
+    const group = body.chattype === 'group';
+    if (group && (!validString(body.chatid, 256) || onPairingMessage)) return;
     if (onPairingMessage) {
       if (body.msgtype === 'text' && validString(body.from?.userid, 256) && body.from.userid !== botId &&
           !body.from.bot && !body.isForward && !body.isForwarded && !body.forwarded && !body.forward && !body.quote) {
@@ -161,12 +166,14 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
     if (!content) return;
     const { mediaRefs, ...parts } = content;
     const message = {
-      id: body.msgid, senderId: ownerId, conversationId, ...parts,
+      id: body.msgid, senderId: body.from.userid, conversationId: group ? body.chatid : body.from.userid, ...parts,
+      ...(group ? {chatType: 'group', botMentioned: true} : {}),
       replyContext: { reqId: frame.headers.req_id, ...(mediaRefs.length ? { mediaRefs } : {}) },
     };
     if (Number.isSafeInteger(body.create_time) && body.create_time > 0 && Number.isSafeInteger(body.create_time * 1000)) {
       message.timestamp = body.create_time * 1000;
     }
+    if (!conversationRoute(routing, message)) return;
     // The official smart-bot protocol has no separate consumer ACK for this
     // callback. Commit to core before completing our handler; never pre-dedup.
     await onMessage(message);
@@ -290,6 +297,32 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
       await Promise.allSettled([...tasks, ...mediaTasks]);
     },
     status() { return { connected, displaced, authenticationFailed }; },
+    canProgressFinal({text}) {
+      return typeof text === 'string' && text.length <= channel.nativeMaxReplyText && Buffer.byteLength(text) <= 20480;
+    },
+    async beginProgress({message, authorize}) {
+      return provider.sendProgress({message, text: '正在处理…', authorize});
+    },
+    async sendProgress({message, text, reference, final = false, authorize}) {
+      if (!connected || controller.signal.aborted || !socket) throw new Error('WeCom is disconnected.');
+      ownMessage(message);
+      if (typeof text !== 'string' || !text.trim() || !text.isWellFormed() || !provider.canProgressFinal({text})) {
+        throw new Error('WeCom stream exceeds the native text limit.');
+      }
+      const id = 'dotbridge_' + createHash('sha256').update(JSON.stringify([message.conversationId, message.id])).digest('hex').slice(0, 32);
+      if (reference && reference.id !== id) throw new Error('WeCom stream does not match its source message.');
+      const source = socket;
+      authorizeSend(authorize);
+      await track(request(source, message.replyContext.reqId, 'aibot_respond_msg', {
+        msgtype: 'stream', stream: {id, finish: final, content: text},
+      }));
+      return {id, text};
+    },
+    async finishProgress({message, reference, cancelled, replacement, authorize}) {
+      if (!reference || typeof reference.text !== 'string') throw new Error('WeCom stream reference is unavailable.');
+      const text = cancelled ? replacement ? '完整回复将作为附件发送。' : '本条处理已结束。' : reference.text;
+      await provider.sendProgress({message, text, reference, final: true, authorize});
+    },
     async sendOwnerMessage({text, authorize}) {
       if (!connected || controller.signal.aborted || !socket || !ownerId || typeof text !== 'string' || !text.trim() || !text.isWellFormed() || text.length > 2000) throw new Error('WeCom owner text is unavailable.');
       authorizeSend(authorize);
@@ -351,8 +384,8 @@ function createTransport({ credentials, onMessage, signal, fetch = globalThis.fe
     },
     async sendReply({ message, text, idempotencyKey, authorize }) {
       if (!connected || controller.signal.aborted || !socket) throw new Error('WeCom is disconnected.');
-      if (message?.senderId !== ownerId || message?.conversationId !== conversationId ||
-          !validString(message.replyContext?.reqId) || typeof text !== 'string' || !text.trim() || !text.isWellFormed() ||
+      ownMessage(message);
+      if (typeof text !== 'string' || !text.trim() || !text.isWellFormed() ||
           text.length > channel.maxReplyText || Buffer.byteLength(text) > 60000 || !validString(idempotencyKey, 1024)) {
         throw new Error('WeCom reply is invalid or exceeds 20,000 characters.');
       }

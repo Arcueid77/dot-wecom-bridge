@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createProvider } from '../src/provider.js';
+import {interactionPolicy} from '@dot-bridge/core/channels/experience-policy.js';
+import {channel} from '../src/channel.js';
 
 const credentials = { botId: 'fixture-bot', secret: 'fixture-secret', ownerId: 'fixture-owner', conversationId: 'fixture-owner' };
 
@@ -36,6 +38,38 @@ function message(overrides = {}, reqId = 'fixture-req') {
       msgtype: 'text', text: { content: 'Fixture question' }, ...overrides },
   };
 }
+
+test('configured WeCom groups retain actor and conversation and native streams finalize one ID', async t => {
+  const {Socket, instances} = sockets();
+  const messages = [];
+  const interaction = interactionPolicy({groups: [{conversation_id: 'group-1', members: 'allowlist', allow_from: ['member-1']}]}, channel);
+  const provider = createProvider({credentials, interaction, WebSocket: Socket, onMessage: async value => messages.push(value)});
+  t.after(() => provider.stop());
+  await provider.start();
+  const socket = instances[0];
+  socket.authenticate();
+  socket.receive(message({chattype: 'group', chatid: 'group-1', from: {userid: 'other'}}));
+  socket.receive(message({chattype: 'group', chatid: 'unselected', from: {userid: 'member-1'}}));
+  socket.receive(message({chattype: 'group', chatid: 'group-1', from: {userid: 'member-1'}}));
+  await until(() => messages.length === 1);
+  assert.equal(messages[0].senderId, 'member-1');
+  assert.equal(messages[0].conversationId, 'group-1');
+  assert.equal(messages[0].chatType, 'group');
+  const first = provider.sendProgress({message: messages[0], text: 'First', authorize() {}});
+  const initial = socket.sent.at(-1);
+  assert.equal(initial.body.stream.finish, false);
+  socket.receive({headers: initial.headers, errcode: 0});
+  const reference = await first;
+  const final = provider.sendProgress({message: messages[0], text: 'First and final', reference, final: true, authorize() {}});
+  const last = socket.sent.at(-1);
+  assert.equal(last.body.stream.id, initial.body.stream.id);
+  assert.equal(last.body.stream.finish, true);
+  socket.receive({headers: last.headers, errcode: 0});
+  await final;
+  const count = socket.sent.length;
+  await assert.rejects(provider.sendProgress({message: {...messages[0], conversationId: 'other'}, text: 'blocked', reference, authorize() {}}));
+  assert.equal(socket.sent.length, count);
+});
 
 test('proactive WeCom uses a fresh request ID and the bound single chat rather than a callback request',async t=>{
  const {Socket,instances}=sockets();const provider=createProvider({credentials,WebSocket:Socket,onMessage:async()=>{}});t.after(()=>provider.stop());await provider.start();instances[0].authenticate();
